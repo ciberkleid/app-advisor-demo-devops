@@ -1,0 +1,114 @@
+name: Run Application Advisor
+
+on:
+  workflow_dispatch: # Manual trigger (from GitHub UI).
+  push:
+    branches: ["main"] # Run on updates to main.
+  workflow_run:
+    workflows: ["Merge Pull Request"]
+    types: [completed] # Run after merge workflow completes.
+
+jobs:
+  run-app-advisor:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write # needed for branch + push
+      pull-requests: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0 # required for branching + diff history
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven # Cache ~/.m2 to speed up builds.
+
+      - name: Enable access to Spring Enterprise Artifactory
+        uses: s4u/maven-settings-action@v3.1.0
+        with:
+          servers: '[{"id": "tanzu-spring-release", "username": "${{ secrets.BC_REG_USER }}", "password": "${{ secrets.BC_REG_TOKEN }}"}]'
+          repositories: '[{"id":"tanzu-spring-release","name":"Spring Enterprise Supported Releases","url":"https://packages.broadcom.com/artifactory/spring-enterprise","snapshots":{"enabled":false}}]'
+
+      - name: Install advisor CLI
+        env:
+          BC_REG_TOKEN: ${{ secrets.BC_REG_TOKEN }}
+          ADVISOR_VERSION: ${{ vars.advisor_version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            -H "Authorization: Bearer ${BC_REG_TOKEN}" \
+            -o /tmp/advisor-cli.tar \
+            "https://packages.broadcom.com/artifactory/spring-enterprise/com/vmware/tanzu/spring/application-advisor-cli-linux/${ADVISOR_VERSION}/application-advisor-cli-linux-${ADVISOR_VERSION}.tar"
+          tar -xf /tmp/advisor-cli.tar -C /tmp --strip-components=1 --exclude=./META-INF
+          install /tmp/advisor /usr/local/bin/advisor
+          
+          advisor --version
+
+      - name: Install trivy CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin # Consider pinning a specific version.
+          
+          trivy --version
+
+      - name: Upgrade app
+        env:
+          SPRING_ADVISOR_MAPPING_CUSTOM_0_FILEPATH: "${{ github.workspace }}/${{ vars.spring_advisor_mapping_custom_0_filepath }}"
+          SPRING_ADVISOR_MAPPING_CUSTOM_0_MERGE_STRATEGY: ${{ vars.spring_advisor_mapping_custom_0_merge_strategy }}
+        run: |
+          set -euo pipefail
+
+          filter_progress() {
+            tr '\r' '\n' | grep -Ev "[🏃🔨].*\[[0-9]+m [0-9]+s\]$"
+          }
+
+          echo "== Generating upgrade plan =="
+          advisor upgrade-plan get 2>&1 | filter_progress
+
+          echo "== Scanning SBOM for CVEs =="
+          jq '.sbom' target/.advisor/build-config.json > target/.advisor/sbom.json
+          trivy sbom -q --no-progress --table-mode summary target/.advisor/sbom.json
+
+          echo "== Applying next step in upgrade plan =="
+          advisor upgrade-plan apply --from-yml 2>&1 | filter_progress
+
+      - name: Create PR if changes exist
+        env:
+          GH_TOKEN: ${{ secrets.GIT_TOKEN_FOR_PRS }}
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "No changes detected — skipping PR creation."
+            exit 0
+          fi
+
+          BRANCH="advisor-upgrade-$(date +%Y%m%d-%H%M%S)"
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "refactor: apply Application Advisor upgrade plan"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$BRANCH"
+
+          gh pr create \
+            --title "refactor: apply App Advisor changes" \
+            --body "Automated PR generated from Application Advisor upgrade plan." \
+            --base main \
+            --head "$BRANCH"
+
+      - name: Get errors if exist
+        if: ${{ hashFiles('.advisor/errors/**') != '' }} # Match any file under errors/.
+        run: |
+          cat .advisor/errors/*
+          echo "❌ Errors detected in .advisor/errors/! Failing the workflow."
+          exit 1
